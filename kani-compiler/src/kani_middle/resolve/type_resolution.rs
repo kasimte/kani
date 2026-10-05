@@ -463,3 +463,9 @@ fn parse_len(len: &Expr) -> Result<usize, String> {
     }
     Err(format!("Expected a `usize` constant, but found `{}`", len.to_token_stream()))
 }
+
+/// Parses an array-length expression as a `usize` literal, for the semantic
+/// argument matcher in the parent module. `None` if it is not such a literal.
+pub(super) fn parse_len_pub(len: &Expr) -> Option<usize> {
+    parse_len(len).ok()
+}

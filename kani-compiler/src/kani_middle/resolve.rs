@@ -13,6 +13,7 @@ use rustc_hir::def::{DefKind, Res};
 use rustc_hir::def_id::{CRATE_DEF_INDEX, DefId, LOCAL_CRATE, LocalDefId, LocalModId};
 use rustc_hir::{ItemKind, UseKind};
 use rustc_middle::ty::TyCtxt;
+use rustc_middle::ty::consts::ConstExt;
 use rustc_middle::ty::fast_reject::{self, TreatParams};
 use rustc_public::CrateDef;
 use rustc_public::mir::mono::Instance;
@@ -105,7 +106,7 @@ pub fn resolve_fn_path<'tcx>(
         // Qualified path for a non-primitive type, such as `<Bar>::foo>`.
         Some(QSelf { ty: syn_ty, .. }) => {
             let ty = type_resolution::resolve_ty(tcx, current_module, syn_ty)?;
-            let def_id = resolve_in_user_type(tcx, ty, path.path.segments.iter())?;
+            let def_id = resolve_in_user_type(tcx, current_module, ty, path.path.segments.iter())?;
             validate_kind!(tcx, def_id, "function / method", DefKind::Fn | DefKind::AssocFn)?;
             Ok(FnResolution::Fn(stable_fn_def(tcx, def_id).unwrap()))
         }
@@ -163,7 +164,7 @@ fn resolve_path<'tcx>(
             let base = match def_kind {
                 DefKind::ForeignMod | DefKind::Mod => resolve_in_module(tcx, base, &name),
                 DefKind::Struct | DefKind::Enum | DefKind::Union => {
-                    resolve_in_type_def(tcx, base, &base_path_args, &name)
+                    resolve_in_type_def(tcx, current_module, base, &base_path_args, &name)
                 }
                 DefKind::Trait => resolve_in_trait_def(tcx, base, &name),
                 kind => {
@@ -658,6 +659,7 @@ fn resolve_in_glob_use(tcx: TyCtxt, res: &Res, name: &str) -> RelativeResolution
 /// Resolves a function in a user type (non-primitive).
 fn resolve_in_user_type<'tcx, 'a, I>(
     tcx: TyCtxt<'tcx>,
+    current_module: LocalDefId,
     ty: Ty,
     mut segments: I,
 ) -> Result<DefId, ResolveError<'tcx>>
@@ -684,7 +686,13 @@ where
     if segments.next().is_some() {
         Err(ResolveError::UnexpectedType { tcx, item: def_id, expected: "module" })
     } else {
-        resolve_in_type_def(tcx, def_id, &PathArguments::None, &name.ident.to_string())
+        resolve_in_type_def(
+            tcx,
+            current_module,
+            def_id,
+            &PathArguments::None,
+            &name.ident.to_string(),
+        )
     }
 }
 
@@ -695,6 +703,7 @@ fn generic_args_to_string<T: ToTokens>(args: &T) -> String {
 /// Resolves a function in a type given its `def_id`.
 fn resolve_in_type_def<'tcx>(
     tcx: TyCtxt<'tcx>,
+    current_module: LocalDefId,
     type_id: DefId,
     base_path_args: &PathArguments,
     name: &str,
@@ -747,21 +756,20 @@ fn resolve_in_type_def<'tcx>(
                 }),
                 // Otherwise, use the provided generic arguments to refine our options.
                 PathArguments::AngleBracketed(args) => {
-                    let generic_args = generic_args_to_string(&args);
                     let refined_candidates: Vec<DefId> = candidates
                         .iter()
                         .cloned()
                         .filter(|item| {
-                            is_item_name_with_generic_args(tcx, *item, &generic_args, name)
+                            impl_self_type_matches(tcx, current_module, tcx.parent(*item), args)
                         })
                         .collect();
                     match refined_candidates.len() {
-                        0 => Err(invalid_path_err(&generic_args, candidates)),
+                        0 => Err(invalid_path_err(&generic_args_to_string(&args), candidates)),
                         1 => Ok(refined_candidates[0]),
-                        // Item paths differ past the base type, so more than one match
-                        // should not happen — but the comparison is normalization-based,
-                        // so report the ambiguity (with the still-colliding candidates)
-                        // rather than crashing the compiler.
+                        // Distinct inherent impls with the same erased self type cannot
+                        // both define `name` (coherence), so more than one match should
+                        // not happen — but report the ambiguity (with the still-colliding
+                        // candidates) rather than crashing the compiler.
                         _ => Err(ResolveError::AmbiguousPartialPath {
                             tcx,
                             name: name.into(),
@@ -776,6 +784,345 @@ fn resolve_in_type_def<'tcx>(
             }
         }
     }
+}
+
+/// True if `impl_id`'s self type matches the user's written generic arguments.
+///
+/// The written arguments are compared against the self type's arguments
+/// semantically: a resolvable type argument must equal the impl's argument as a
+/// region-erased `Ty`; the impl's own parameter names written as arguments
+/// (`T`, `A` in `impl<T, A> Holder<Mu<T>, A>`) and impl-side parameters are
+/// wildcards; a const literal must equal the impl's const argument; lifetimes
+/// are ignored. An omitted trailing argument matches through the parameter's
+/// declared default.
+fn impl_self_type_matches<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    current_module: LocalDefId,
+    impl_id: DefId,
+    args: &syn::AngleBracketedGenericArguments,
+) -> bool {
+    use rustc_middle::ty::{GenericArgKind as InternalArgKind, TyKind as InternalTyKind};
+    let self_ty = tcx.erase_and_anonymize_regions(
+        tcx.type_of(impl_id).instantiate_identity().skip_normalization(),
+    );
+    let InternalTyKind::Adt(adt_def, impl_args) = self_ty.kind() else {
+        return false;
+    };
+    // A bare written identifier is a wildcard ONLY when it names one of the
+    // impl's own generic parameters — an identifier that names nothing (a
+    // typo'd type) must not match.
+    let param_names: Vec<String> =
+        tcx.generics_of(impl_id).own_params.iter().map(|p| p.name.to_string()).collect();
+    let mut user_args =
+        args.args.iter().filter(|arg| !matches!(arg, syn::GenericArgument::Lifetime(_))).peekable();
+    for (param_index, impl_arg) in impl_args.iter().enumerate() {
+        match impl_arg.kind() {
+            InternalArgKind::Lifetime(_) => continue,
+            InternalArgKind::Type(impl_ty) => match user_args.next() {
+                Some(syn::GenericArgument::Type(syn_ty)) => {
+                    if !syn_ty_matches_ty(tcx, current_module, syn_ty, impl_ty, &param_names) {
+                        return false;
+                    }
+                }
+                Some(_) => return false,
+                // Omitted trailing argument: match through the declared default,
+                // instantiated with the impl's own earlier arguments (mirroring how
+                // rustc fills omitted arguments). No default => no match.
+                None => {
+                    let args_so_far: Vec<_> = impl_args.iter().take(param_index).collect();
+                    match default_for_param(tcx, adt_def.did(), param_index, &args_so_far) {
+                        Some(default_ty) => {
+                            if tcx.erase_and_anonymize_regions(default_ty)
+                                != tcx.erase_and_anonymize_regions(impl_ty)
+                            {
+                                return false;
+                            }
+                        }
+                        None => return false,
+                    }
+                }
+            },
+            InternalArgKind::Const(impl_ct) => match user_args.next() {
+                Some(syn::GenericArgument::Const(expr)) => {
+                    let Some(param_ty) = const_param_ty(tcx, adt_def.did(), param_index) else {
+                        return false;
+                    };
+                    if !const_lit_matches(tcx, expr, impl_ct, param_ty) {
+                        return false;
+                    }
+                }
+                // syn parses a bare const-parameter name (`S::<N>`) as a type
+                // path; the impl's own parameter name is a wildcard.
+                Some(syn::GenericArgument::Type(syn::Type::Path(type_path)))
+                    if type_path.qself.is_none()
+                        && type_path.path.get_ident().is_some_and(|ident| {
+                            param_names.iter().any(|n| n == &ident.to_string())
+                        }) => {}
+                Some(_) => return false,
+                None => return false,
+            },
+        }
+    }
+    // More written arguments than parameters: no match.
+    user_args.peek().is_none()
+}
+
+/// True if the written type matches the impl's (region-erased) type argument.
+/// Resolvable types compare as erased `Ty`s; the impl's own parameter names
+/// (`param_names`) and impl-side type parameters are wildcards; otherwise match
+/// structurally (same ADT + matching arguments, tuples/references/pointers/
+/// slices/arrays component-wise) so a parameter name may sit anywhere inside an
+/// argument (`MaybeUninit<T>`).
+fn syn_ty_matches_ty<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    current_module: LocalDefId,
+    syn_ty: &syn::Type,
+    impl_ty: rustc_middle::ty::Ty<'tcx>,
+    param_names: &[String],
+) -> bool {
+    use rustc_middle::ty::TyKind as InternalTyKind;
+    // A bare identifier naming one of the impl's own generic parameters is that
+    // parameter (the param-name spelling) — a wildcard — never a coincidentally
+    // same-named type. Check this before any type resolution, so a crate type
+    // sharing a parameter's name cannot shadow the wildcard.
+    if let syn::Type::Path(type_path) = syn_ty
+        && type_path.qself.is_none()
+        && type_path
+            .path
+            .get_ident()
+            .is_some_and(|ident| param_names.iter().any(|n| n == &ident.to_string()))
+    {
+        return true;
+    }
+    // Fast path: the written type resolves — compare erased types directly.
+    // A canonical argument path written from a sibling module (e.g.
+    // `num::even::EvenNumber<i32>` inside a separate `verify` module) does not
+    // resolve relative to `current_module`, so fall back to the crate root —
+    // this mirrors how the impl's self type is rendered as a crate-absolute path.
+    let resolved = type_resolution::resolve_ty(tcx, current_module, syn_ty)
+        .or_else(|_| type_resolution::resolve_ty(tcx, rustc_hir::def_id::CRATE_DEF_ID, syn_ty));
+    if let Ok(user_ty) = resolved {
+        let user_internal = tcx.erase_and_anonymize_regions(rustc_internal::internal(tcx, user_ty));
+        return user_internal == tcx.erase_and_anonymize_regions(impl_ty);
+    }
+    // Impl-side parameter: matches anything the user wrote.
+    if matches!(impl_ty.kind(), InternalTyKind::Param(_)) {
+        return true;
+    }
+    match syn_ty {
+        syn::Type::Paren(inner) => {
+            syn_ty_matches_ty(tcx, current_module, &inner.elem, impl_ty, param_names)
+        }
+        // Same ADT, arguments matched recursively (how a parameter name nested in
+        // a concrete constructor, `MaybeUninit<T>`, matches).
+        syn::Type::Path(syn::TypePath { qself: None, path }) => {
+            let InternalTyKind::Adt(adt_def, adt_args) = impl_ty.kind() else {
+                return false;
+            };
+            let Ok(base_id) = resolve_path(tcx, current_module, path) else {
+                return false;
+            };
+            if base_id != adt_def.did() {
+                return false;
+            }
+            let syn::PathArguments::AngleBracketed(args) = &path.segments.last().unwrap().arguments
+            else {
+                return false;
+            };
+            let mut user_args = args
+                .args
+                .iter()
+                .filter(|arg| !matches!(arg, syn::GenericArgument::Lifetime(_)))
+                .peekable();
+            for (nested_index, arg) in adt_args.iter().enumerate() {
+                match arg.kind() {
+                    rustc_middle::ty::GenericArgKind::Lifetime(_) => continue,
+                    rustc_middle::ty::GenericArgKind::Type(nested_ty) => match user_args.next() {
+                        Some(syn::GenericArgument::Type(nested_syn)) => {
+                            if !syn_ty_matches_ty(
+                                tcx,
+                                current_module,
+                                nested_syn,
+                                nested_ty,
+                                param_names,
+                            ) {
+                                return false;
+                            }
+                        }
+                        _ => return false,
+                    },
+                    rustc_middle::ty::GenericArgKind::Const(nested_ct) => {
+                        match user_args.next() {
+                            Some(syn::GenericArgument::Const(expr)) => {
+                                let Some(param_ty) =
+                                    const_param_ty(tcx, adt_def.did(), nested_index)
+                                else {
+                                    return false;
+                                };
+                                if !const_lit_matches(tcx, expr, nested_ct, param_ty) {
+                                    return false;
+                                }
+                            }
+                            // The impl's own const-parameter name in a nested
+                            // position (`Arr<N>`): wildcard, same rule as above.
+                            Some(syn::GenericArgument::Type(syn::Type::Path(p)))
+                                if p.qself.is_none()
+                                    && p.path.get_ident().is_some_and(|i| {
+                                        param_names.iter().any(|n| n == &i.to_string())
+                                    }) => {}
+                            _ => return false,
+                        }
+                    }
+                }
+            }
+            user_args.peek().is_none()
+        }
+        syn::Type::Tuple(tuple) => {
+            let InternalTyKind::Tuple(elems) = impl_ty.kind() else {
+                return false;
+            };
+            tuple.elems.len() == elems.len()
+                && tuple
+                    .elems
+                    .iter()
+                    .zip(elems.iter())
+                    .all(|(s, t)| syn_ty_matches_ty(tcx, current_module, s, t, param_names))
+        }
+        syn::Type::Reference(reference) => {
+            let InternalTyKind::Ref(_, elem, mutability) = impl_ty.kind() else {
+                return false;
+            };
+            (reference.mutability.is_some()
+                == matches!(mutability, rustc_middle::ty::Mutability::Mut))
+                && syn_ty_matches_ty(tcx, current_module, &reference.elem, *elem, param_names)
+        }
+        syn::Type::Ptr(ptr) => {
+            let InternalTyKind::RawPtr(elem, mutability) = impl_ty.kind() else {
+                return false;
+            };
+            (ptr.mutability.is_some() == matches!(mutability, rustc_middle::ty::Mutability::Mut))
+                && syn_ty_matches_ty(tcx, current_module, &ptr.elem, *elem, param_names)
+        }
+        syn::Type::Slice(slice) => {
+            let InternalTyKind::Slice(elem) = impl_ty.kind() else {
+                return false;
+            };
+            syn_ty_matches_ty(tcx, current_module, &slice.elem, *elem, param_names)
+        }
+        syn::Type::Array(array) => {
+            let InternalTyKind::Array(elem, len) = impl_ty.kind() else {
+                return false;
+            };
+            let len_matches = match type_resolution::parse_len_pub(&array.len) {
+                Some(user_len) => {
+                    len.try_to_target_usize(tcx).is_some_and(|impl_len| impl_len == user_len as u64)
+                }
+                None => false,
+            };
+            len_matches && syn_ty_matches_ty(tcx, current_module, &array.elem, *elem, param_names)
+        }
+        // Everything else (trait objects with unsupported shapes, bare fns the
+        // BareFn arm rejects, macros, …): resolve_ty already declined above, and
+        // there is no structural arm — no match.
+        _ => false,
+    }
+}
+
+/// The declared default type for `adt`'s `param_index`-th parameter, instantiated
+/// with the impl's own earlier arguments. `None` if the parameter has no declared
+/// default (mirroring how rustc fills only trailing defaults). Inputs are already
+/// internal here, so this is the internal-only core of `default_type_arg`.
+fn default_for_param<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    adt: DefId,
+    param_index: usize,
+    args_so_far: &[rustc_middle::ty::GenericArg<'tcx>],
+) -> Option<rustc_middle::ty::Ty<'tcx>> {
+    let default = tcx.generics_of(adt).own_params.get(param_index)?.default_value(tcx)?;
+    default.instantiate(tcx, args_so_far).skip_normalization().as_type()
+}
+
+/// The declared type of `adt`'s `param_index`-th generic parameter — a const
+/// parameter's annotation (`usize`, `char`, `i8`, …). `None` if the index is
+/// out of range (malformed args).
+fn const_param_ty<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    adt: DefId,
+    param_index: usize,
+) -> Option<rustc_middle::ty::Ty<'tcx>> {
+    let param = tcx.generics_of(adt).own_params.get(param_index)?;
+    Some(tcx.type_of(param.def_id).instantiate_identity().skip_normalization())
+}
+
+/// True if a written const argument (an integer/bool/char literal, possibly
+/// negated) equals the impl's const argument. `param_ty` is the const
+/// parameter's declared type (from `const_param_ty`) — consts do not carry
+/// their type on current nightlies, so the caller supplies it.
+fn const_lit_matches<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    expr: &syn::Expr,
+    impl_ct: rustc_middle::ty::Const<'tcx>,
+    param_ty: rustc_middle::ty::Ty<'tcx>,
+) -> bool {
+    use rustc_middle::ty::{Const, TypingEnv};
+    // A leading `-` on a const argument reaches us either as a unary-neg
+    // expression or (depending on syn's parse) folded into the literal's own
+    // digits; `negated` tracks the former, the `Lit::Int` arm the latter.
+    let (lit, negated) = match expr {
+        syn::Expr::Lit(lit) => (&lit.lit, false),
+        syn::Expr::Unary(syn::ExprUnary { op: syn::UnOp::Neg(_), expr: inner, .. }) => {
+            match &**inner {
+                syn::Expr::Lit(lit) => (&lit.lit, true),
+                _ => return false,
+            }
+        }
+        _ => return false,
+    };
+    let typing_env = TypingEnv::fully_monomorphized();
+    let Ok(layout) = tcx.layout_of(typing_env.as_query_input(param_ty)) else {
+        return false;
+    };
+    let size = layout.size;
+    let user_ct = match lit {
+        syn::Lit::Int(int) => {
+            // syn may keep the sign inside the literal (`base10_digits()` ==
+            // "-7"); combine it with any outer unary negation.
+            let digits = int.base10_digits();
+            let (magnitude, lit_negated) = match digits.strip_prefix('-') {
+                Some(rest) => (rest, true),
+                None => (digits, false),
+            };
+            let negated = negated || lit_negated;
+            let Ok(v) = magnitude.parse::<u128>() else { return false };
+            // A literal outside the parameter type's range names no impl value;
+            // truncating it would silently match a DIFFERENT impl (256 as u8 is
+            // 0, 200 as i8 is -56). Reject out-of-range instead of truncating.
+            let bits = if negated {
+                let min_magnitude = 1u128 << (size.bits() - 1);
+                if !param_ty.is_signed() || v > min_magnitude {
+                    return false;
+                }
+                size.truncate((v as i128).wrapping_neg() as u128)
+            } else {
+                let max = if param_ty.is_signed() {
+                    (1u128 << (size.bits() - 1)) - 1
+                } else {
+                    size.unsigned_int_max()
+                };
+                if v > max {
+                    return false;
+                }
+                v
+            };
+            Const::from_bits(tcx, bits, typing_env, param_ty)
+        }
+        syn::Lit::Bool(b) if !negated => Const::from_bool(tcx, b.value),
+        syn::Lit::Char(c) if !negated => {
+            Const::from_bits(tcx, c.value() as u128, typing_env, param_ty)
+        }
+        _ => return false,
+    };
+    user_ct == impl_ct
 }
 
 /// Resolves a function in a trait definition.
@@ -868,418 +1215,4 @@ fn is_item_name(tcx: TyCtxt, item: DefId, name: &str) -> bool {
     let item_path = tcx.def_path_str(item);
     let last = item_path.split("::").last().unwrap();
     last == name
-}
-
-/// Use this when we don't just care about the item name matching (c.f. is_item_name),
-/// but also if the generic arguments are the same, e.g. <u32>::unchecked_add.
-fn is_item_name_with_generic_args(
-    tcx: TyCtxt,
-    item: DefId,
-    generic_args: &str,
-    name: &str,
-) -> bool {
-    let item_path = tcx.def_path_str(item);
-    last_two_items_of_path_match(&item_path, generic_args, name)
-}
-
-/// True if `s` has a `,` at bracket depth 0 (a tuple/list separator, not one nested
-/// inside `<...>` or `(...)`). Whitespace-independent.
-fn has_top_level_comma(s: &str) -> bool {
-    let mut depth = 0i32;
-    for c in s.chars() {
-        match c {
-            '<' | '(' => depth += 1,
-            '>' | ')' => depth -= 1,
-            ',' if depth == 0 => return true,
-            _ => {}
-        }
-    }
-    false
-}
-
-/// Normalizes one side of a `::<args>::name` comparison string: redundant trait-object
-/// parens are stripped from each TOP-LEVEL generic argument and all whitespace is
-/// removed, so the parenthesized rendering `def_path_str` uses and the bare spelling a
-/// user writes compare equal in either impl location. A trait object nested inside
-/// another argument keeps its rendered parens (a residual the semantic rewrite removes).
-fn normalized_last_two(s: &str) -> String {
-    let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
-    let Some((head, name)) = s.rsplit_once("::") else { return s };
-    let Some((prefix, rest)) = head.split_once('<') else { return s };
-    let Some(args) = rest.strip_suffix('>') else { return s };
-    format!("{prefix}<{}>::{name}", strip_redundant_parens(args))
-}
-
-// This is just a helper function for is_item_name_with_generic_args.
-// It's in a separate function so we can unit-test it without a mock TyCtxt or DefIds.
-fn last_two_items_of_path_match(item_path: &str, generic_args: &str, name: &str) -> bool {
-    let mut angle_bracket_depth = 0;
-    let mut parts = Vec::new();
-    let mut part_start = 0;
-    // `i` is a byte offset, so the previous character is carried from the last
-    // iteration rather than re-counted with `chars().nth` (a char count, which
-    // desyncs on multibyte paths and made the slices below panic or mis-split).
-    let mut prev = None;
-
-    for (i, c) in item_path.char_indices() {
-        match c {
-            '<' => {
-                angle_bracket_depth += 1;
-            }
-            '>' => {
-                angle_bracket_depth -= 1;
-            }
-            ':' if angle_bracket_depth == 0 && prev == Some(':') => {
-                if part_start < i {
-                    // `i - 1` is the first colon of `::` (ASCII, one byte), so this
-                    // byte slice always ends on a char boundary.
-                    parts.push(&item_path[part_start..i - 1]);
-                }
-                part_start = i + 1;
-            }
-            _ => {}
-        }
-        prev = Some(c);
-    }
-    parts.push(&item_path[part_start..]);
-
-    if parts.len() < 2 {
-        return false;
-    }
-
-    let actual_last_two =
-        format!("{}{}{}{}", "::", parts[parts.len() - 2], "::", parts[parts.len() - 1]);
-
-    let last_two = format!("{}{}{}", generic_args, "::", name);
-
-    // The last two components of the item_path should be the same as
-    // ::{generic_args}::{name}. Both sides are normalized identically (redundant
-    // trait-object parens stripped from top-level arguments, whitespace removed), so the
-    // parenthesized rendering def_path_str uses and the bare spelling a user writes match
-    // in either impl location.
-    let normalized_query = normalized_last_two(&last_two);
-    if normalized_query == normalized_last_two(&actual_last_two) {
-        return true;
-    }
-
-    // A method whose impl block lives outside its self type's home module is rendered
-    // by def_path_str as `<impl path::to::Type<Args>>` instead of `Type::<Args>`; unwrap
-    // that form and retry against Args through the same normalization (so either paren
-    // spelling matches in either impl location).
-    if let Some(self_type_args) = impl_self_type_generic_args(parts[parts.len() - 2]) {
-        let unwrapped_last_two = format!("::<{}>::{}", self_type_args, parts[parts.len() - 1]);
-        return normalized_query == normalized_last_two(&unwrapped_last_two);
-    }
-
-    false
-}
-
-/// If `part` is the `<impl SELF_TYPE>` form def_path_str uses for a method whose impl
-/// block lives outside SELF_TYPE's home module, returns the bracket-balanced contents
-/// of SELF_TYPE's outermost `<...>` (its generic arguments). `None` if `part` isn't
-/// that form, SELF_TYPE isn't generic, or its generic list can't be parsed by bracket
-/// counting (e.g. an argument contains `->`).
-fn impl_self_type_generic_args(part: &str) -> Option<&str> {
-    let self_type = part.strip_prefix("<impl ")?.strip_suffix('>')?;
-    let start = self_type.find('<')?;
-    let mut depth = 0;
-    for (i, c) in self_type[start..].char_indices() {
-        match c {
-            '<' => depth += 1,
-            '>' => {
-                depth -= 1;
-                if depth == 0 {
-                    // A close before the final char means bracket counting mis-parsed
-                    // the list (e.g. the `>` of a fn-pointer's `->`): decline.
-                    if start + i == self_type.len() - 1 {
-                        return Some(&self_type[start + 1..start + i]);
-                    }
-                    return None;
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-/// Splits a `,`-separated generic-argument list on its top-level commas and strips one
-/// layer of parens from any top-level argument whose interior has no top-level comma —
-/// the redundant grouping def_path_str adds around a trait-object bound (`(dyn …)`).
-/// Tuple-type parens (a top-level comma) are semantic and preserved. Lists containing
-/// `->` are returned unchanged.
-fn strip_redundant_parens(args: &str) -> String {
-    // `->` (fn-pointer / `Fn`-sugar renderings) would corrupt the depth counting
-    // below; skip normalization for such lists.
-    if args.contains("->") {
-        return args.to_string();
-    }
-
-    let mut depth = 0i32;
-    let mut parts = Vec::new();
-    let mut part_start = 0;
-
-    for (i, c) in args.char_indices() {
-        match c {
-            '<' | '(' => depth += 1,
-            '>' | ')' => depth -= 1,
-            ',' if depth == 0 => {
-                parts.push(&args[part_start..i]);
-                part_start = i + 1;
-            }
-            _ => {}
-        }
-    }
-    parts.push(&args[part_start..]);
-
-    parts
-        .into_iter()
-        .map(|part| {
-            // The top-level split leaves the ", " separator's space on every part
-            // after the first; trim so the paren check sees the argument itself.
-            let part = part.trim();
-            // A fully-parenthesized argument whose interior has no top-level comma is
-            // redundant grouping def_path_str adds around a trait-object bound
-            // (`(dyn Any + 'static)`); the user writes it bare. A top-level comma means a
-            // tuple type, whose parens are semantic and must stay. Whitespace-independent,
-            // so it matches whether or not the caller pre-stripped spaces.
-            if fully_parenthesized(part) && !has_top_level_comma(&part[1..part.len() - 1]) {
-                &part[1..part.len() - 1]
-            } else {
-                part
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
-/// Whether `s` starts with `(`, ends with `)`, and that opening paren's match is the
-/// closing one at the end (as opposed to e.g. `(a)(b)`, which is wrapped but not by a
-/// single pair).
-fn fully_parenthesized(s: &str) -> bool {
-    if !s.starts_with('(') || !s.ends_with(')') {
-        return false;
-    }
-    let mut depth = 0i32;
-    for (i, c) in s.char_indices() {
-        match c {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return i == s.len() - 1;
-                }
-            }
-            _ => {}
-        }
-    }
-    false
-}
-
-#[cfg(test)]
-mod tests {
-    mod simple_last_two_items_of_path_match {
-        use crate::kani_middle::resolve::{
-            impl_self_type_generic_args, last_two_items_of_path_match, strip_redundant_parens,
-        };
-
-        #[test]
-        fn length_one_item_prefix() {
-            let generic_args = "::<u32>";
-            let name = "unchecked_add";
-            let item_path = format!("NonZero{generic_args}::{name}");
-            assert!(last_two_items_of_path_match(&item_path, generic_args, name))
-        }
-
-        #[test]
-        fn length_three_item_prefix() {
-            let generic_args = "::<u32>";
-            let name = "unchecked_add";
-            let item_path = format!("core::num::NonZero{generic_args}::{name}");
-            assert!(last_two_items_of_path_match(&item_path, generic_args, name))
-        }
-
-        #[test]
-        fn wrong_generic_arg() {
-            let generic_args = "::<u64>";
-            let name = "unchecked_add";
-            let item_path = format!("core::num::NonZero{}::{}", "::<u32>", name);
-            assert!(!last_two_items_of_path_match(&item_path, generic_args, name))
-        }
-
-        #[test]
-        fn generic_args_with_segmented_params() {
-            let generic_args = "::<core::mem::MaybeUninit<T>,A>";
-            let name = "assume_init";
-            let item_path = format!("rc::Rc{}::{}", "::<core::mem::MaybeUninit<T>, A>", name);
-            assert!(last_two_items_of_path_match(&item_path, generic_args, name))
-        }
-
-        // When a method's impl block lives outside its self type's home module (e.g. the
-        // dyn-self `downcast_unchecked` impls in alloc's boxed::convert vs. boxed::Box),
-        // def_path_str renders it as `<impl path::Type<Args>>` instead of `Type::<Args>`,
-        // with the trait-object bound additionally wrapped in redundant parens.
-        #[test]
-        fn impl_self_type_dyn_args_match() {
-            let generic_args = "::<dyn core::any::Any + 'static, A>";
-            let name = "downcast_unchecked";
-            let item_path = format!(
-                "boxed::convert::<impl boxed::Box<(dyn core::any::Any + 'static), A>>::{name}"
-            );
-            assert!(last_two_items_of_path_match(&item_path, generic_args, name))
-        }
-
-        #[test]
-        fn impl_self_type_dyn_args_mismatch() {
-            let generic_args = "::<dyn core::any::Any, A>";
-            let name = "downcast_unchecked";
-            let item_path = format!(
-                "boxed::convert::<impl boxed::Box<(dyn core::any::Any + 'static), A>>::{name}"
-            );
-            assert!(!last_two_items_of_path_match(&item_path, generic_args, name))
-        }
-
-        // Unlike a trait-object bound, a tuple type's parens are semantic, not disambiguation
-        // wrapping: `S<(u32, u64), A>` has two generic args (a tuple, and A), not three. The
-        // bare, unparenthesized spelling must not falsely match; the user can still spell the
-        // tuple with parens to match how def_path_str renders it.
-        #[test]
-        fn impl_self_type_tuple_args_not_stripped() {
-            let name = "method";
-            let item_path = format!("m::<impl m::S<(u32, u64), A>>::{name}");
-            assert!(!last_two_items_of_path_match(&item_path, "::<u32, u64, A>", name));
-            assert!(last_two_items_of_path_match(&item_path, "::<(u32, u64), A>", name));
-        }
-
-        // A non-generic self type outside its home module (`<impl m::S>`, no `<...>` on S)
-        // has no generic args to refine against, so the fallback must not spuriously match.
-        #[test]
-        fn impl_self_type_non_generic_no_fallback() {
-            let generic_args = "::<u32>";
-            let name = "method";
-            let item_path = format!("m::<impl m::S>::{name}");
-            assert!(!last_two_items_of_path_match(&item_path, generic_args, name))
-        }
-
-        // A generic argument containing `->` (fn-pointer / `Fn`-sugar rendering) defeats
-        // simple bracket counting: the arrow's `>` reads as a close. Extraction must
-        // decline (clean no-match), never return a truncated argument list. Note the
-        // full pipeline declines such candidates one stage earlier (the top-level `::`
-        // split leaves them unmatchable), so the direct assert is what exercises this
-        // guard; the end-to-end assert pins the pipeline's own no-match.
-        #[test]
-        fn impl_self_type_fn_ptr_args_decline() {
-            assert_eq!(impl_self_type_generic_args("<impl m::S<fn() -> u32, A>>"), None);
-            let name = "method";
-            let item_path = format!("m::x::<impl m::S<fn() -> u32, A>>::{name}");
-            assert!(!last_two_items_of_path_match(&item_path, "::<fn()->u32,A>", name));
-        }
-
-        // An arrow-bearing list corrupts the comma-depth scan (the `>` of `->` closes
-        // nothing), which could split at a nested comma and strip parens that aren't
-        // top-level. Normalization is skipped wholesale for such lists; unstripped
-        // parens can only fail to match, never match the wrong candidate.
-        #[test]
-        fn strip_redundant_parens_arrow_list_unchanged() {
-            let args = "::<fn()->u32,(dyn Any + 'static),B>";
-            assert_eq!(strip_redundant_parens(args), args);
-        }
-
-        // generic_args_to_string strips whitespace before this helper ever runs, but the
-        // helper shouldn't rely on its caller: a spaced turbofish must match on the
-        // primary (same-module) path too, as it already does on the fallback path.
-        #[test]
-        fn whitespace_insensitive_primary_match() {
-            assert!(last_two_items_of_path_match("m::S::<u32, A>::f", "::<u32, A>", "f"));
-        }
-
-        // def_path_str separates arguments with ", ", so every argument after the first
-        // arrives from the top-level split with a leading space. The paren-strip must
-        // still recognize a trait-object bound there; the bare spelling matches
-        // regardless of the bound's position in the list.
-        #[test]
-        fn impl_self_type_dyn_second_position() {
-            assert_eq!(
-                strip_redundant_parens("u32, (dyn core::any::Any + 'static)"),
-                "u32,dyn core::any::Any + 'static"
-            );
-            let name = "method";
-            let item_path =
-                format!("m::x::<impl m::Q<u32, (dyn core::any::Any + 'static)>>::{name}");
-            assert!(last_two_items_of_path_match(
-                &item_path,
-                "::<u32, dyn core::any::Any + 'static>",
-                name
-            ));
-        }
-
-        // A trait-object argument on an impl BESIDE its type (primary path): def_path_str
-        // renders `(dyn ...)`, and generic_args_to_string hands us a whitespace-free user
-        // side — so both must normalize equal. Inputs here are whitespace-free, matching
-        // what the pipeline actually produces (a spaced input would hide the bug).
-        #[test]
-        fn dyn_bound_parens_in_module() {
-            let name = "double_tag";
-            let item_path = format!("ty::D::<(dynstd::any::Any+'static)>::{name}");
-            assert!(last_two_items_of_path_match(&item_path, "::<dynstd::any::Any+'static>", name));
-            assert!(last_two_items_of_path_match(
-                &item_path,
-                "::<(dynstd::any::Any+'static)>",
-                name
-            ));
-        }
-
-        // Same, on the cross-module `<impl ...>` fallback path.
-        #[test]
-        fn dyn_bound_parens_cross_module() {
-            let name = "double_tag";
-            let item_path = format!("ops::<impl ty::D<(dynstd::any::Any+'static)>>::{name}");
-            assert!(last_two_items_of_path_match(&item_path, "::<dynstd::any::Any+'static>", name));
-            assert!(last_two_items_of_path_match(
-                &item_path,
-                "::<(dynstd::any::Any+'static)>",
-                name
-            ));
-        }
-
-        // A tuple argument's parens are semantic: they must NOT be stripped, so a tuple
-        // never matches the same types spelled as a flat argument list.
-        #[test]
-        fn tuple_parens_preserved() {
-            let name = "f";
-            let item_path = format!("m::S::<(u32,u64),A>::{name}");
-            assert!(last_two_items_of_path_match(&item_path, "::<(u32,u64),A>", name));
-            assert!(!last_two_items_of_path_match(&item_path, "::<u32,u64,A>", name));
-        }
-
-        #[test]
-        fn multibyte_path_char_boundary() {
-            // A multibyte char before the first `::` used to desync the splitter's
-            // byte/char indexing (char-boundary panic on the part slice).
-            let generic_args = "::<u32>";
-            let name = "unchecked_add";
-            let item_path = format!("café::núm::NonZero{generic_args}::{name}");
-            assert!(last_two_items_of_path_match(&item_path, generic_args, name))
-        }
-
-        #[test]
-        fn multibyte_path_component_kept() {
-            // Same desync could instead silently drop a path component.
-            let generic_args = "::<u32>";
-            let name = "unchecked_add";
-            let item_path = format!("éa::NonZero{generic_args}::{name}");
-            assert!(last_two_items_of_path_match(&item_path, generic_args, name))
-        }
-
-        #[test]
-        fn multibyte_path_char_const_generic() {
-            // The description's realistic trigger: a non-ASCII `char` const-generic
-            // puts a multibyte char inside the generic-args part (not a leading
-            // component), which desynced the old byte/char guard.
-            let generic_args = "::<'🦀'>";
-            let name = "f";
-            let item_path = format!("m::S{generic_args}::{name}");
-            assert!(last_two_items_of_path_match(&item_path, generic_args, name))
-        }
-    }
 }
